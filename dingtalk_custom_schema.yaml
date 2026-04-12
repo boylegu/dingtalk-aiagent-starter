@@ -1,0 +1,107 @@
+openapi: 3.0.1
+info:
+  title: 统一AI入口
+  description: 将用户当前输入透传到统一AIAgent处理
+  version: v1.0.0
+
+x-dingtalk-protocol: stream
+x-dingtalk-display-result: disabled
+
+paths:
+  /v1/actions/agent/dispatch:
+    post:
+      summary: 转发用户输入到统一AIAgent
+      description: 将当前用户输入、发送人、组织信息以及会话相关上下文通过 Stream 模式转发给本地服务
+      operationId: DispatchUserInput
+
+      parameters:
+        - name: conversationToken
+          in: query
+          required: false
+          schema:
+            type: string
+            x-dingtalk-context:
+              property: currentConversation
+              format: conversationToken
+        - name: threadId
+          in: query
+          required: false
+          schema:
+            type: string
+            x-dingtalk-context:
+              property: currentConversation
+              format: threadId
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                input:
+                  type: string
+                  description: 用户当前输入
+                  x-dingtalk-context:
+                    property: currentInput
+                    format: raw
+
+                attribute:
+                  type: string
+                  description: 输入属性
+                  x-dingtalk-context:
+                    property: currentInput
+                    format: attribute
+
+                sender:
+                  type: string
+                  description: 当前发送人 userId
+                  x-dingtalk-context:
+                    property: currentUser
+                    format: userId
+
+                corpId:
+                  type: string
+                  description: 当前组织 corpId
+                  x-dingtalk-context:
+                    property: currentOrg
+                    format: corpId
+
+                threadId:
+                  type: string
+                  description: 当前会话 threadId（尝试透传，不保证直通模式一定下发）
+                  x-dingtalk-context:
+                    property: currentInput
+                    format: threadId
+
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchResponse'
+
+components:
+  schemas:
+    DispatchResponse:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 返回给用户的文本
+        input:
+          type: string
+          description: 本次收到的原始输入
+        sender:
+          type: string
+          description: 发送人
+        corpId:
+          type: string
+          description: 组织ID
+        threadId:
+          type: string
+          description: 当前会话ID
+        conversationToken:
+          type: string
+          description: 当前会话的回复凭证
