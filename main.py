@@ -7,21 +7,22 @@ import asyncio
 import time
 import os
 from urllib.parse import urlparse, parse_qs
-from typing import Optional
 
-import aiohttp
 from dotenv import load_dotenv
 from dingtalk_stream import AckMessage
 import dingtalk_stream
 
+from agentflowbus import Bus, NATSDriver, Envelope, MessageReceived
 
 # Load environment variables
 load_dotenv()
 
 # Default configurations
-DEFAULT_AIAGENT_URL = "http://127.0.0.1:8000/chat"
+DEFAULT_AGENT_ID = "dingtalk-proxy"
+DEFAULT_BUS_URL = "nats://localhost:4222"
+DEFAULT_SUBJECT_PREFIX = "acp.v1"
+DEFAULT_TENANT = ""
 DEFAULT_MAX_CONCURRENCY = 100
-DEFAULT_CONNECT_TIMEOUT = 1.0
 DEFAULT_TOTAL_TIMEOUT = 8.0
 DEFAULT_FALLBACK_TEXT = "当前请求较多或服务暂时不可用，请稍后再试。"
 DEFAULT_LOG_LEVEL = "INFO"
@@ -53,19 +54,29 @@ def define_options():
         help='DingTalk app_secret or suite_secret (can also set via DINGTALK_CLIENT_SECRET environment variable)'
     )
     parser.add_argument(
-        '--aiagent_url', dest='aiagent_url',
-        default=os.getenv('AIAGENT_URL', DEFAULT_AIAGENT_URL),
-        help=f'AI Agent service URL, default: {DEFAULT_AIAGENT_URL} (can also set via AIAGENT_URL environment variable)'
+        '--agent_id', dest='agent_id',
+        default=os.getenv('AGENT_ID', DEFAULT_AGENT_ID),
+        help=f'Agent ID for this proxy service, default: {DEFAULT_AGENT_ID} (can also set via AGENT_ID environment variable)'
+    )
+    parser.add_argument(
+        '--bus_url', dest='bus_url',
+        default=os.getenv('BUS_URL', DEFAULT_BUS_URL),
+        help=f'Message bus URL, default: {DEFAULT_BUS_URL} (can also set via BUS_URL environment variable)'
+    )
+    parser.add_argument(
+        '--subject_prefix', dest='subject_prefix',
+        default=os.getenv('SUBJECT_PREFIX', DEFAULT_SUBJECT_PREFIX),
+        help=f'Subject prefix for agentflowbus, default: {DEFAULT_SUBJECT_PREFIX} (can also set via SUBJECT_PREFIX environment variable)'
+    )
+    parser.add_argument(
+        '--tenant', dest='tenant',
+        default=os.getenv('TENANT', DEFAULT_TENANT),
+        help='Tenant identifier for agentflowbus (can also set via TENANT environment variable)'
     )
     parser.add_argument(
         '--max_concurrency', dest='max_concurrency', type=int,
         default=int(os.getenv('MAX_CONCURRENCY', DEFAULT_MAX_CONCURRENCY)),
-        help=f'Max concurrent requests, default: {DEFAULT_MAX_CONCURRENCY} (can also set via MAX_CONCURRENCY environment variable)'
-    )
-    parser.add_argument(
-        '--connect_timeout', dest='connect_timeout', type=float,
-        default=float(os.getenv('CONNECT_TIMEOUT', DEFAULT_CONNECT_TIMEOUT)),
-        help=f'HTTP connection timeout in seconds, default: {DEFAULT_CONNECT_TIMEOUT} (can also set via CONNECT_TIMEOUT environment variable)'
+        help=f'Max concurrent publish requests, default: {DEFAULT_MAX_CONCURRENCY} (can also set via MAX_CONCURRENCY environment variable)'
     )
     parser.add_argument(
         '--total_timeout', dest='total_timeout', type=float,
@@ -99,7 +110,7 @@ def define_options():
     if args.max_concurrency <= 0:
         parser.error("max_concurrency must be a positive integer.")
 
-    if args.connect_timeout <= 0 or args.total_timeout <= 0:
+    if args.total_timeout <= 0:
         parser.error("timeout values must be positive numbers.")
 
     return args
@@ -108,9 +119,8 @@ def define_options():
 class DispatchHandler(dingtalk_stream.GraphHandler):
     def __init__(
         self,
-        aiagent_url: str,
+        bus: Bus,
         max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
-        connect_timeout: float = DEFAULT_CONNECT_TIMEOUT,
         total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
         fallback_text: str = DEFAULT_FALLBACK_TEXT,
         test_mode: bool = False,
@@ -118,30 +128,28 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
     ):
         super().__init__()
         self.logger = logger or logging.getLogger(__name__)
-        self.aiagent_url = aiagent_url
+        self.bus = bus
         self.max_concurrency = max_concurrency
-        self.connect_timeout = connect_timeout
         self.total_timeout = total_timeout
         self.fallback_text = fallback_text
         self.test_mode = test_mode
 
         self.semaphore = asyncio.Semaphore(max_concurrency)
-        self._http_session = None
-        self._timeout = aiohttp.ClientTimeout(
-            total=total_timeout,
-            connect=connect_timeout,
-        )
+        self._bus_lock = asyncio.Lock()
+        self._bus_ready = False
 
-    @property
-    def http_session(self):
-        """Lazy create http session in async context to avoid event loop error"""
-        if self._http_session is None:
-            self._http_session = aiohttp.ClientSession(timeout=self._timeout)
-        return self._http_session
+    async def _ensure_bus(self):
+        if self._bus_ready:
+            return
+        async with self._bus_lock:
+            if self._bus_ready:
+                return
+            await self.bus.connect()
+            self._bus_ready = True
+            self.logger.info("agentflowbus connected to %s", self.bus.transport._url)
 
     async def close(self):
-        if self._http_session is not None:
-            await self._http_session.close()
+        await self.bus.close()
 
     async def process(self, callback: dingtalk_stream.CallbackMessage):
         start_ts = time.time()
@@ -188,26 +196,77 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                 trace_id, sender, corp_id, thread_id, conversation_token, session_key
             )
 
-            # 并发保护：入口层不要无限制打下游
-            async with self.semaphore:
-                result = await self.forward_to_aiagent(
-                    trace_id=trace_id,
-                    sender=sender,
-                    corp_id=corp_id,
-                    input_text=input_text,
-                    thread_id=thread_id,
-                    conversation_token=conversation_token,
-                    session_key=session_key,
-                    attr_obj=attr_obj,
+            # Test mode: return test response directly
+            if self.test_mode:
+                text = (
+                    f"🤖 测试模式已启用\n\n"
+                    f"收到你的消息：{input_text}\n\n"
+                    f"发送者ID：{sender}\n"
+                    f"企业ID：{corp_id}\n"
+                    f"会话ID：{thread_id}"
                 )
+                response = dingtalk_stream.GraphResponse()
+                response.status_line.code = 200
+                response.status_line.reason_phrase = "OK"
+                response.headers["Content-Type"] = "application/json"
+                response.body = json.dumps({
+                    "text": text,
+                    "input": input_text,
+                    "sender": sender,
+                    "corpId": corp_id,
+                    "threadId": thread_id,
+                    "conversationToken": conversation_token,
+                }, ensure_ascii=False)
+                return AckMessage.STATUS_OK, response.to_dict()
+
+            # Ensure bus is connected
+            await self._ensure_bus()
+
+            # Build and publish message
+            payload = {
+                "channel": "dingtalk",
+                "tenant_id": corp_id,
+                "user_id": sender,
+                "thread_id": thread_id,
+                "conversation_token": conversation_token,
+                "session_hint": session_key,
+                "text": input_text,
+                "message_type": attr_obj.get("msgType", "text"),
+                "trace_id": trace_id,
+                "metadata": {
+                    "source": "dingtalk-stream",
+                    "attr": attr_obj,
+                }
+            }
+
+            env = Envelope.new(MessageReceived)
+            env.trace_id = trace_id
+            env.session_id = session_key
+            env.conversation_id = conversation_token
+            env.tenant_id = corp_id
+            env.user_id = sender
+            env.channel = "dingtalk"
+            env.from_ = self.bus.agent_id
+            env.payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+            self.logger.info(
+                "publishing message traceId=%s event_type=%s",
+                trace_id, env.event_type
+            )
+
+            async with self.semaphore:
+                try:
+                    await self.bus.publish(env)
+                    text = "已收到，正在处理中..."
+                except Exception:
+                    self.logger.exception("failed to publish message traceId=%s", trace_id)
+                    text = self.fallback_text
 
             cost_ms = int((time.time() - start_ts) * 1000)
             self.logger.info(
-                "request finished traceId=%s sender=%s cost_ms=%s",
+                "request accepted traceId=%s sender=%s cost_ms=%s",
                 trace_id, sender, cost_ms
             )
-
-            text = result.get("text") or result.get("answer") or self.fallback_text
 
             response = dingtalk_stream.GraphResponse()
             response.status_line.code = 200
@@ -237,90 +296,24 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
 
             return AckMessage.STATUS_OK, response.to_dict()
 
-    async def forward_to_aiagent(
-        self,
-        trace_id: str,
-        sender: str,
-        corp_id: str,
-        input_text: str,
-        thread_id: str,
-        conversation_token: str,
-        session_key: str,
-        attr_obj: dict,
-    ) -> dict:
-        # Test mode: return test response directly without calling backend
-        if self.test_mode:
-            self.logger.info("test mode enabled, returning test response traceId=%s", trace_id)
-            return {
-                "text": f"🤖 测试模式已启用\n\n收到你的消息：{input_text}\n\n发送者ID：{sender}\n企业ID：{corp_id}\n会话ID：{thread_id}"
-            }
 
-        payload = {
-            "channel": "dingtalk",
-            "tenant_id": corp_id,
-            "user_id": sender,
-            "thread_id": thread_id,
-            "conversation_token": conversation_token,
-            "session_hint": session_key,
-            "text": input_text,
-            "message_type": attr_obj.get("msgType", "text"),
-            "trace_id": trace_id,
-            "metadata": {
-                "source": "dingtalk-stream",
-                "attr": attr_obj,
-            }
-        }
-
-        self.logger.info(
-            "forwarding to aiagent traceId=%s url=%s payload=%s",
-            trace_id, self.aiagent_url, json.dumps(payload, ensure_ascii=False)
-        )
-
-        try:
-            async with self.http_session.post(self.aiagent_url, json=payload) as resp:
-                resp_text = await resp.text()
-
-                self.logger.info(
-                    "aiagent response traceId=%s status=%s body=%s",
-                    trace_id, resp.status, resp_text
-                )
-
-                if resp.status != 200:
-                    return {
-                        "text": self.fallback_text
-                    }
-
-                try:
-                    return json.loads(resp_text)
-                except Exception:
-                    self.logger.warning("aiagent response is not valid json traceId=%s", trace_id)
-                    return {
-                        "text": resp_text or self.fallback_text
-                    }
-
-        except asyncio.TimeoutError:
-            self.logger.warning("aiagent timeout traceId=%s", trace_id)
-            return {
-                "text": self.fallback_text
-            }
-        except Exception:
-            self.logger.exception("failed to call aiagent traceId=%s", trace_id)
-            return {
-                "text": self.fallback_text
-            }
-
-
-def main():
-    options = define_options()
-    logger = setup_logger(options.log_level)
-
+async def run_services(options, logger):
     credential = dingtalk_stream.Credential(options.client_id, options.client_secret)
-    client = dingtalk_stream.DingTalkStreamClient(credential)
+    client = dingtalk_stream.DingTalkStreamClient(credential, logger=logger)
+
+    transport = NATSDriver(url=options.bus_url, name=options.agent_id)
+    bus = Bus(
+        agent_id=options.agent_id,
+        transport=transport,
+        tenant=options.tenant,
+        subject_prefix=options.subject_prefix,
+        default_timeout=options.total_timeout,
+        logger=logger,
+    )
 
     handler = DispatchHandler(
-        aiagent_url=options.aiagent_url,
+        bus=bus,
         max_concurrency=options.max_concurrency,
-        connect_timeout=options.connect_timeout,
         total_timeout=options.total_timeout,
         fallback_text=options.fallback_text,
         test_mode=options.test_mode,
@@ -328,7 +321,7 @@ def main():
     )
 
     if options.test_mode:
-        logger.info("✅ Test mode enabled: No backend AI service required, will return test responses directly")
+        logger.info("✅ Test mode enabled: No backend AI service required")
 
     client.register_callback_handler(
         dingtalk_stream.GraphMessage.TOPIC,
@@ -336,16 +329,20 @@ def main():
     )
 
     try:
-        client.start_forever()
+        await client.start()
     finally:
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(handler.close())
-            else:
-                loop.run_until_complete(handler.close())
-        except Exception:
-            logger.exception("failed to close http session")
+        await handler.close()
+        logger.info("Shutdown complete")
+
+
+def main():
+    options = define_options()
+    logger = setup_logger(options.log_level)
+
+    try:
+        asyncio.run(run_services(options, logger))
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
 
 
 if __name__ == '__main__':
