@@ -5,7 +5,7 @@ info:
   version: v1.0.0
 
 x-dingtalk-protocol: stream
-x-dingtalk-display-result: disabled
+x-dingtalk-display-result: enabled
 
 paths:
   /v1/actions/agent/dispatch:
@@ -89,7 +89,7 @@ components:
       properties:
         text:
           type: string
-          description: 返回给用户的文本
+          description: 最终需要直接展示给用户的回复文本，必须原样展示，不要由模型总结、改写或补充
         input:
           type: string
           description: 本次收到的原始输入
