@@ -186,7 +186,12 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
             sender = body.get("sender", "")
             corp_id = body.get("corpId", "")
             input_text = body.get("input", "")
-            thread_id = body.get("threadId") or body.get("thread_id") or ""
+            thread_id = (
+                body.get("threadId")
+                or body.get("thread_id")
+                or query_params.get("threadId", [""])[0]
+                or ""
+            )
             conversation_token = query_params.get("conversationToken", [""])[0]
 
             session_key = f"{corp_id}:{sender}:{thread_id}" if thread_id else f"{corp_id}:{sender}"
