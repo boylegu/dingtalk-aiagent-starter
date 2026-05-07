@@ -27,6 +27,15 @@ DEFAULT_TOTAL_TIMEOUT = 8.0
 DEFAULT_FALLBACK_TEXT = "当前请求较多或服务暂时不可用，请稍后再试。"
 DEFAULT_LOG_LEVEL = "INFO"
 
+THREAD_ID_KEYS = (
+    "threadId",
+    "thread_id",
+    "conversationThreadId",
+    "conversationId",
+    "openConversationId",
+    "chatId",
+)
+
 
 def setup_logger(log_level: str = DEFAULT_LOG_LEVEL):
     logger = logging.getLogger()
@@ -116,6 +125,31 @@ def define_options():
     return args
 
 
+def first_present_string(*values):
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def find_nested_string(value, keys):
+    if isinstance(value, dict):
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            found = find_nested_string(item, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = find_nested_string(item, keys)
+            if found:
+                return found
+    return ""
+
+
 class DispatchHandler(dingtalk_stream.GraphHandler):
     def __init__(
         self,
@@ -186,13 +220,19 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
             sender = body.get("sender", "")
             corp_id = body.get("corpId", "")
             input_text = body.get("input", "")
-            thread_id = (
-                body.get("threadId")
-                or body.get("thread_id")
-                or query_params.get("threadId", [""])[0]
-                or ""
+            thread_id = first_present_string(
+                body.get("threadId"),
+                body.get("thread_id"),
+                query_params.get("threadId", [""])[0],
+                find_nested_string(attr_obj, THREAD_ID_KEYS),
+                find_nested_string(callback.data, THREAD_ID_KEYS),
             )
-            conversation_token = query_params.get("conversationToken", [""])[0]
+            conversation_token = first_present_string(
+                query_params.get("conversationToken", [""])[0],
+                body.get("conversationToken"),
+                body.get("conversation_token"),
+                find_nested_string(callback.data, ("conversationToken", "conversation_token")),
+            )
 
             session_key = f"{corp_id}:{sender}:{thread_id}" if thread_id else f"{corp_id}:{sender}"
 
@@ -203,12 +243,19 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
 
             # Test mode: return test response directly
             if self.test_mode:
+                diagnostics = {
+                    "requestUri": request.request_line.uri,
+                    "query": {key: values[0] if len(values) == 1 else values for key, values in query_params.items()},
+                    "bodyKeys": sorted(body.keys()),
+                    "attributeKeys": sorted(attr_obj.keys()) if isinstance(attr_obj, dict) else [],
+                }
                 text = (
                     f"🤖 测试模式已启用\n\n"
                     f"收到你的消息：{input_text}\n\n"
                     f"发送者ID：{sender}\n"
                     f"企业ID：{corp_id}\n"
-                    f"会话ID：{thread_id}"
+                    f"会话ID：{thread_id or '未下发'}\n"
+                    f"conversationToken：{conversation_token or '未下发'}"
                 )
                 response = dingtalk_stream.GraphResponse()
                 response.status_line.code = 200
@@ -221,6 +268,7 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                     "corpId": corp_id,
                     "threadId": thread_id,
                     "conversationToken": conversation_token,
+                    "diagnostics": diagnostics,
                 }, ensure_ascii=False)
                 return AckMessage.STATUS_OK, response.to_dict()
 
