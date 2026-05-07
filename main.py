@@ -243,18 +243,13 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
 
             # Test mode: return test response directly
             if self.test_mode:
-                diagnostics = {
-                    "requestUri": request.request_line.uri,
-                    "query": {key: values[0] if len(values) == 1 else values for key, values in query_params.items()},
-                    "bodyKeys": sorted(body.keys()),
-                    "attributeKeys": sorted(attr_obj.keys()) if isinstance(attr_obj, dict) else [],
-                }
                 text = (
-                    f"🤖 测试模式已启用\n\n"
-                    f"收到你的消息：{input_text}\n\n"
-                    f"发送者ID：{sender}\n"
-                    f"企业ID：{corp_id}\n"
-                    f"会话ID：{thread_id or '未下发'}\n"
+                    "[TEST_MODE_SYNC_REPLY]\n"
+                    "这条回复来自本地 dingtalk-aiagent-starter 的 test_mode，同步返回给钉钉。\n\n"
+                    f"收到的用户输入：{input_text}\n"
+                    f"sender：{sender}\n"
+                    f"corpId：{corp_id}\n"
+                    f"threadId：{thread_id or '未下发'}\n"
                     f"conversationToken：{conversation_token or '未下发'}"
                 )
                 response = dingtalk_stream.GraphResponse()
@@ -262,13 +257,7 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                 response.status_line.reason_phrase = "OK"
                 response.headers["Content-Type"] = "application/json"
                 response.body = json.dumps({
-                    "text": text,
-                    "input": input_text,
-                    "sender": sender,
-                    "corpId": corp_id,
-                    "threadId": thread_id,
-                    "conversationToken": conversation_token,
-                    "diagnostics": diagnostics,
+                    "text": text
                 }, ensure_ascii=False)
                 return AckMessage.STATUS_OK, response.to_dict()
 
