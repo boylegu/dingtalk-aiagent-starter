@@ -31,6 +31,22 @@ paths:
             x-dingtalk-context:
               property: currentConversation
               format: threadId
+        - name: openConversationId
+          in: query
+          required: false
+          schema:
+            type: string
+            x-dingtalk-context:
+              property: currentConversation
+              format: openConversationId
+        - name: runId
+          in: query
+          required: false
+          schema:
+            type: string
+            x-dingtalk-context:
+              property: currentConversation
+              format: runId
 
       requestBody:
         required: true
@@ -73,6 +89,20 @@ paths:
                   x-dingtalk-context:
                     property: currentConversation
                     format: threadId
+
+                openConversationId:
+                  type: string
+                  description: 当前会话 openConversationId（群聊消息发送等场景需要）
+                  x-dingtalk-context:
+                    property: currentConversation
+                    format: openConversationId
+
+                runId:
+                  type: string
+                  description: 当前 AI 助理运行 runId
+                  x-dingtalk-context:
+                    property: currentConversation
+                    format: runId
 
               required:
                 - input
