@@ -8,6 +8,7 @@ import time
 import os
 from urllib.parse import urlparse, parse_qs
 
+from agentflowbus.session import session_id
 from dotenv import load_dotenv
 from dingtalk_stream import AckMessage
 import dingtalk_stream
@@ -34,6 +35,19 @@ THREAD_ID_KEYS = (
     "conversationId",
     "openConversationId",
     "chatId",
+)
+
+OPEN_CONVERSATION_ID_KEYS = (
+    "openConversationId",
+    "open_conversation_id",
+    "conversationId",
+    "conversation_id",
+    "chatId",
+)
+
+RUN_ID_KEYS = (
+    "runId",
+    "run_id",
 )
 
 
@@ -227,18 +241,34 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                 find_nested_string(attr_obj, THREAD_ID_KEYS),
                 find_nested_string(callback.data, THREAD_ID_KEYS),
             )
+            open_conversation_id = first_present_string(
+                query_params.get("openConversationId", [""])[0],
+                body.get("openConversationId"),
+                body.get("open_conversation_id"),
+                find_nested_string(attr_obj,OPEN_CONVERSATION_ID_KEYS),
+                find_nested_string(callback.data, OPEN_CONVERSATION_ID_KEYS),
+            )
+
+            run_id = first_present_string(
+                query_params.get("runId", [""])[0],
+                body.get("runId"),
+                body.get("run_id"),
+                find_nested_string(attr_obj,RUN_ID_KEYS),
+                find_nested_string(callback.data, RUN_ID_KEYS),
+            )
+
             conversation_token = first_present_string(
                 query_params.get("conversationToken", [""])[0],
                 body.get("conversationToken"),
                 body.get("conversation_token"),
                 find_nested_string(callback.data, ("conversationToken", "conversation_token")),
             )
-
-            session_key = f"{corp_id}:{sender}:{thread_id}" if thread_id else f"{corp_id}:{sender}"
+            session_id = first_present_string(thread_id, open_conversation_id)
+            session_key = f"{corp_id}:{sender}:{session_id}" if session_id else f"{corp_id}:{sender}"
 
             self.logger.info(
-                "resolved fields traceId=%s sender=%s corpId=%s threadId=%s conversationToken=%s sessionKey=%s",
-                trace_id, sender, corp_id, thread_id, conversation_token, session_key
+                "resolved fields traceId=%s sender=%s corpId=%s threadId=%s openConversationId=%s runId=%s conversationToken=%s sessionKey=%s",
+                trace_id, sender, corp_id, thread_id, open_conversation_id, run_id, conversation_token, session_key
             )
 
             # Test mode: return test response directly
@@ -249,7 +279,9 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                     f"收到的用户输入：{input_text}\n"
                     f"sender：{sender}\n"
                     f"corpId：{corp_id}\n"
-                    f"threadId：{thread_id or '未下发'}\n"
+                    f"threadId：{thread_id or '未下发'}\n",
+                    f"open_conversation_id：{open_conversation_id or '未下发'}\n",
+                    f"run_id: {run_id or '未下发'}\n"
                     f"conversationToken：{conversation_token or '未下发'}"
                 )
                 response = dingtalk_stream.GraphResponse()
@@ -275,6 +307,8 @@ class DispatchHandler(dingtalk_stream.GraphHandler):
                 "text": input_text,
                 "message_type": attr_obj.get("msgType", "text"),
                 "trace_id": trace_id,
+                "open_conversation_id": open_conversation_id,
+                "run_id": run_id,
                 "metadata": {
                     "source": "dingtalk-stream",
                     "attr": attr_obj,
